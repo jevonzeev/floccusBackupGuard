@@ -1,0 +1,12 @@
+[Unit]
+Description=Bookmark file watcher and local git backup
+Requires=mnt-EXTERNALDRIVE.mount
+After=mnt-EXTERNALDRIVE.mount
+BindsTo=mnt-EXTERNALDRIVE.mount
+
+[Service]
+ExecStart=/usr/bin/bash /path/to/floccus backup guard/watch.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
