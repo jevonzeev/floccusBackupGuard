@@ -1,107 +1,140 @@
 # floccus backup guard
 
-An event driven backup pipeline that protects browser bookmarks synced via
-[floccus](https://floccus.org/) against silent data loss from bad syncs.
+An event driven backup pipeline for browser bookmarks synced through
+[floccus](https://floccus.org/), plus a self healing setup for running the
+WebDAV backend on a removable external hard drive.
 
-## The problem
+## Problem
 
-Bookmarks can represent hours of real organising work: saved study courses,
-references, and links built up over a long time. floccus syncs bookmarks
-between browsers through a remote store (WebDAV in this setup). If one
-browser's local bookmarks are empty or corrupted and floccus treats that as
-the source of truth, it can silently overwrite the shared remote copy, and
-from there wipe every other synced browser too. Rebuilding that from
-scratch is slow and often impossible to do perfectly.
+A floccus sync from an empty or broken browser can silently overwrite the
+shared remote bookmarks file, wiping every other synced browser too. If
+that file lives on a removable drive, an unclean disconnect while it is
+being written can also corrupt it or leave services in a broken state.
+
+This project solves both. Every change is captured into a local git
+history on your internal disk, and the WebDAV service starts and stops
+automatically with the external hard drive.
 
 ## Architecture
 
-```
-Browser (floccus extension)
-    WebDAV (Docker, bytemark/webdav)
-    bind mounted bookmarks.xbel on host
-    watched by inotify
-    backup.sh copies and commits to a local git repo
+```mermaid
+flowchart TD
+    A[Browser with floccus extension] -->|HTTP request| B[Docker container WebDAV]
+
+    subgraph EXT[External hard drive]
+        C[Live file bookmarks.xbel]
+        F[Backup mirror copy]
+    end
+
+    subgraph INT[Internal disk]
+        D[watch.sh detects change through inotify]
+        E[backup.sh commits change to local git history]
+    end
+
+    B -->|bind mount| C
+    C --> D
+    D --> E
+    E -->|rsync copy| F
 ```
 
-Every change to the live bookmarks file is detected within seconds and
-snapshotted into a git repository. This gives full version history and
-point in time recovery.
+Live data stays on the external hard drive. The watcher, the backup
+script, and the permanent git history stay on the internal disk, so the
+backup survives even if the external hard drive fails. A mirrored copy is
+also kept on the external hard drive.
+
+## Requirements
+
+* Docker and Docker Compose
+* git
+* inotify tools
+* A Linux distribution using systemd
+* An external hard drive formatted as ext4
+
+## Download
+
+```bash
+git clone https://github.com/jevonzeev/floccusBackupGuard.git
+```
+
+Place the cloned folder on your internal disk, not on the external hard
+drive it manages.
 
 ## Setup
 
-1. Copy `docker-compose.yml`, fill in your own `USERNAME` and `PASSWORD`,
-   and run:
-   ```bash
-   docker compose up -d
-   ```
-
-2. Install `inotify-tools`:
-   ```bash
-   sudo apt install inotify-tools
-   ```
-
-3. Set the `BOOKMARKSYNC_DIR` environment variable to wherever this project
-   lives (it defaults to the current directory if unset). 
-
-   Run `watch.sh` as a persistent process. A systemd user service is recommended, so it
-   survives reboots and restarts automatically:
-   ```ini
-   [Unit]
-   Description=Watch and backup floccus bookmarks.xbel
-
-   [Service]
-   ExecStart=/path/to/floccus-backup-guard/watch.sh
-   Restart=always
-
-   [Install]
-   WantedBy=default.target
-   ```
-
-4. Optional, but recommended: add a cron fallback in case the watcher
-   process ever dies silently.
-   ```
- */15 * * * * /path/to/floccus-backup-guard/backup.sh
-   ```
-
-## Checking on it
-
-Confirm the service is alive:
+1. Install inotify tools.
 ```bash
-systemctl --user status bookmark-backup.service
-```
-Look for `Active: active (running)`.
-
-See recent backup activity:
-```bash
-tail -20 backup.log
+sudo apt install inotify tools
 ```
 
-See the full backup history:
+2. Copy `docker-compose.yml` and fill in your own username and password.
+
+3. Find your external hard drive's UUID.
 ```bash
-cd backup
-git log --oneline
+sudo blkid
+```
+
+4. Add an automount entry to `/etc/fstab` using that UUID.
+```
+UUID=your uuid here  /mnt/EXTERNALDRIVE  ext4  nofail,x-systemd.automount,x-systemd.device-timeout=10  0  2
+```
+```bash
+sudo systemctl daemon-reload
+```
+
+5. Copy the two service templates from `systemd/` into
+`/etc/systemd/system/`, editing the mount unit name and file paths to
+match your setup.
+```bash
+sudo cp systemd/webdav_sync.service /etc/systemd/system/
+sudo cp systemd/bookmark_watch.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable now webdav_sync.service bookmark_watch.service
+```
+
+6. Optional. Add a cron fallback in case the watcher ever stops silently.
+```
+*/15 * * * * /path/to/floccus backup guard/backup.sh
+```
+
+## Checking status
+
+```bash
+systemctl status webdav_sync.service
+systemctl status bookmark_watch.service
+findmnt /mnt/EXTERNALDRIVE
+docker ps
 ```
 
 ## Recovering from a bad sync
 
-1. Find the last good backup:
-   ```bash
-   cd backup
-   git log --oneline
-   ```
+```bash
+cd backup-staging
+git log --oneline -- bookmarks.xbel
+sudo sh -c 'git show <commit-hash>:bookmarks.xbel > /path/to/data/bookmarks.xbel'
+```
 
-2. Restore it into the live WebDAV location:
-   ```bash
-   git show <good_commit_hash>:bookmarks.xbel > ../data/bookmarks.xbel
-   ```
+Must be run as `sudo sh -c '...'`, not `sudo git show ...`, because the
+live file is owned by the WebDAV container's user. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) for why.
 
-3. Let floccus sync down that restored file on each browser.
+## Floccus error E030 (failed to decrypt)
 
-## Root cause reminder
+Check the file size first.
+```bash
+stat /path/to/data/bookmarks.xbel
+```
 
-A backup protects you and a sync i not a backup
+Zero bytes means truncation. A normal size that still won't decrypt
+usually means a passphrase mismatch. Either way, the fix is to delete the
+file and let floccus rebuild it.
+```bash
+curl -u <username> -X DELETE http://localhost:8085/bookmarks.xbel
+```
+
+Then sync from a browser with good bookmarks, and use that same
+passphrase on every device afterward. See
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the full explanation.
 
 ## License
 
-MIT, see LICENSE
-
+MIT. See [LICENSE](LICENSE).
